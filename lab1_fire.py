@@ -1,3 +1,10 @@
+"""
+Lab 1: Spread of Forest Fires and Infectious Disease
+
+This script contains the forest-fire model, validation tests,
+wildfire experiments, controlled-burn experiment, and disease model.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
