@@ -1,0 +1,103 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Define the temperatures and cooling coefficient.
+T_i = 145.0  # Initial coffee temperature
+T_f = 80.0   # Target coffee temperature
+T_s = 20.0   # Room temperature
+k = 0.1     # Cooling coefficient
+
+# Set the time step and starting conditions.
+dt = 1.0
+t = 0.0
+T_c = T_i
+
+# Store the initial time and temperature for plotting later.
+times = [t]
+temperatures = [T_c]
+
+# Keep calculating while the coffee is above the target temperature.
+while T_c > T_f:
+    # Calculate the temperature after one time step.
+    T_n = T_c - dt * k * (T_c - T_s)
+
+    # Update the elapsed time and current temperature.
+    t = t + dt
+    T_c = T_n
+
+    # Save each result.
+    times.append(t)
+    temperatures.append(T_c)
+
+# Display the first calculated point at or below the target.
+print(f"Time: {t:.2f}")
+print(f"Temperature: {T_c:.2f}")
+
+# Calculate the analytic solution from time 0 to the last Euler time.
+t_exact = np.linspace(0, t, 200)
+T_exact = T_s + (T_i - T_s) * np.exp(-k * t_exact)
+
+# Compare the numerical and analytic solutions.
+plt.figure(figsize=(8, 5))
+
+plt.plot(t_exact, T_exact, "k-", label="Analytic solution")
+plt.plot(times, temperatures, "o--", label=f"Euler: dt = {dt:g}")
+plt.axhline(T_f, color="gray", linestyle=":", label="Target temperature")
+
+plt.xlabel("Time")
+plt.ylabel("Temperature")
+plt.title("Coffee cooling: Euler and analytic solutions")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Choose time steps to compare and a common end time.
+time_steps = [10.0, 5.0, 1.0, 0.1]
+t_end = 30.0
+
+# Calculate the analytic solution.
+t_exact = np.linspace(0, t_end, 500)
+T_exact = T_s + (T_i - T_s) * np.exp(-k * t_exact)
+
+plt.figure(figsize=(9, 6))
+plt.plot(t_exact, T_exact, "k-", linewidth=2,
+         label="Analytic solution")
+
+# Give each Euler solution a different line style.
+styles = ["o--", "s-.", ":", "--"]
+
+# Repeat the Euler calculation for each time step.
+for dt, style in zip(time_steps, styles):
+    # Reset the starting conditions for each calculation.
+    t = 0.0
+    T_c = T_i
+    times = [t]
+    temperatures = [T_c]
+
+    # Continue to the common end time for comparison.
+    while t < t_end:
+        step = min(dt, t_end - t)
+        T_n = T_c - step * k * (T_c - T_s)
+
+        t = min(t + step, t_end)
+        T_c = T_n
+
+        times.append(t)
+        temperatures.append(T_c)
+
+    # Add this numerical solution to the figure.
+    plt.plot(times, temperatures, style,
+             label=f"Euler: dt = {dt:g}", markersize=4)
+
+# Label and format the comparison figure.
+plt.axhline(T_f, color="gray", linestyle=":",
+            label="Target temperature = 80")
+plt.xlabel("Time")
+plt.ylabel("Temperature")
+plt.title("Figure 2. Coffee cooling for different time steps")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("coffee_euler_comparison.png", dpi=300, bbox_inches="tight")
+plt.show()
