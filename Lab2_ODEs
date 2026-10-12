@@ -1,0 +1,935 @@
+"""
+CLIMATE 410 — Lab 2
+
+The script includes:
+1. Euler and RK45 comparisons.
+2. Competition initial-condition and coefficient studies.
+3. Predator-prey studies and phase diagrams.
+4. Lorenz initial-condition and solver-tolerance studies.
+5. Validation checks with documented expected results.
+
+Some diagnostic figures are generated but are not included in the report.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+import csv
+
+def competition(t, N, a=1, b=2, c=1, d=3):
+    """
+    compute the Lotka-Volterra rates for two competing species.
+
+    t: Time in years.
+    N: Current population densities [N1, N2].
+    a: Growth coefficient for species 1.
+    b: Competition coefficient for species 1.
+    c: Growth coefficient for species 2.
+    d: Competition coefficient for species 2.
+    """
+    N1, N2 = N
+    dN1_dt = a * N1 * (1 - N1) - b * N1 * N2
+    dN2_dt = c * N2 * (1 - N2) - d * N1 * N2
+    return np.array([dN1_dt, dN2_dt])
+
+def predation(t, N, a=1, b=2, c=1, d=3):
+    """
+    compute the Lotka-Volterra rates for a predator-prey system.
+
+    t: Time in years.
+    N: Current population densities [N1, N2].
+    a: Growth coefficient for prey.
+    b: Predation coefficient.
+    c: Death coefficient for predators.
+    d: Predator growth coefficient due to consuming prey.
+    """
+    N1, N2 = N
+    dN1_dt = a * N1 - b * N1 * N2
+    dN2_dt = -c * N2 + d * N1 * N2
+    return np.array([dN1_dt, dN2_dt])
+
+N_initial = np.array([0.3, 0.6])
+
+print(competition(0, N_initial))
+print(predation(0, N_initial))
+
+def euler_solver(function,N_initial, dt, t_final):
+    """
+    Solve the population dynamics using the Euler method.
+
+    N_initial: Initial population densities [N1, N2].
+    dt: Time steps in years.
+    t_final: The duration of the simulation in years.
+    function: The function that computes the rates of change (competition or predation).
+    """
+
+    n_steps = int(t_final / dt)
+    time = np.arange(n_steps + 1) * dt
+
+    population = np.zeros((n_steps + 1, len(N_initial)))
+    population[0] = N_initial
+
+    for i in range(n_steps):
+        rates = function(time[i], population[i])
+        population[i + 1] = population[i] + rates * dt
+
+    return time, population
+
+t_comp, N_comp = euler_solver(
+    competition, N_initial, dt=1, t_final=100
+)
+
+t_pred, N_pred = euler_solver(
+    predation, N_initial, dt=0.05, t_final=100
+)
+
+print("Competition after one step:", N_comp[1])
+print("Predation after one step:", N_pred[1])
+
+def rk45_solver(function, N_initial, time):
+    """
+    Solve population dynamics using RK45.
+
+    function: Function that computes the population rates.
+    N_initial: Initial state vector, such as [N1, N2] or [x, y, z].
+    time: Requested output times, in the model's time units.
+    """
+    solution = solve_ivp(
+        function,
+        (time[0], time[-1]),
+        N_initial,
+        method="RK45",
+        t_eval=time,
+        rtol=1e-8,
+        atol=1e-10
+    )
+
+    if not solution.success:
+        raise RuntimeError(solution.message)
+
+    return solution.t, solution.y.T
+
+t_comp_rk, N_comp_rk = rk45_solver(
+    competition, N_initial, t_comp
+)
+
+t_pred_rk, N_pred_rk = rk45_solver(
+    predation, N_initial, t_pred
+)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Competition model
+axes[0].plot(t_comp, N_comp[:, 0],
+             color="tab:blue", label="Species 1 — Euler")
+axes[0].plot(t_comp, N_comp[:, 1],
+             color="tab:orange", label="Species 2 — Euler")
+
+axes[0].plot(t_comp_rk, N_comp_rk[:, 0], "--",
+             color="tab:blue", label="Species 1 — RK45")
+axes[0].plot(t_comp_rk, N_comp_rk[:, 1], "--",
+             color="tab:orange", label="Species 2 — RK45")
+
+axes[0].set_title("Competition: Euler (dt = 1 yr) vs. RK45")
+
+# Predator-prey model
+axes[1].plot(t_pred, N_pred[:, 0],
+             color="tab:blue", label="Prey — Euler")
+axes[1].plot(t_pred, N_pred[:, 1],
+             color="tab:orange", label="Predators — Euler")
+
+axes[1].plot(t_pred_rk, N_pred_rk[:, 0], "--",
+             color="tab:blue", label="Prey — RK45")
+axes[1].plot(t_pred_rk, N_pred_rk[:, 1], "--",
+             color="tab:orange", label="Predators — RK45")
+
+axes[1].set_title("Predator–prey: Euler (dt = 0.05 yr) vs. RK45")
+
+for ax in axes:
+    ax.set_xlabel("Time (years)")
+    ax.set_ylabel("Population density")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+plt.tight_layout()
+fig.savefig("euler_vs_rk45.png", dpi=300, bbox_inches="tight")
+
+# Smaller Euler steps for comparison
+t_comp_small, N_comp_small = euler_solver(
+    competition, N_initial, dt=0.1, t_final=100
+)
+
+t_pred_small, N_pred_small = euler_solver(
+    predation, N_initial, dt=0.01, t_final=100
+)
+
+# Compare both Euler step sizes against RK45
+fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+
+for j in range(2):
+    # Competition model
+    axes[0, j].plot(
+        t_comp, N_comp[:, j],
+        label="Euler: dt = 1 yr", alpha=0.8
+    )
+    axes[0, j].plot(
+        t_comp_small, N_comp_small[:, j],
+        label="Euler: dt = 0.1 yr", alpha=0.8
+    )
+    axes[0, j].plot(
+        t_comp_rk, N_comp_rk[:, j],
+        "k--", label="RK45"
+    )
+    axes[0, j].set_title(f"Competition: Species {j + 1}")
+
+    # Predator-prey model
+    axes[1, j].plot(
+        t_pred, N_pred[:, j],
+        label="Euler: dt = 0.05 yr", alpha=0.8
+    )
+    axes[1, j].plot(
+        t_pred_small, N_pred_small[:, j],
+        label="Euler: dt = 0.01 yr", alpha=0.8
+    )
+    axes[1, j].plot(
+        t_pred_rk, N_pred_rk[:, j],
+        "k--", label="RK45"
+    )
+    species = ["Prey", "Predators"][j]
+    axes[1, j].set_title(f"Predator–prey: {species}")
+
+for ax in axes.flat:
+    ax.set_xlabel("Time (years)")
+    ax.set_ylabel("Population density")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+fig.suptitle("Effect of Euler time-step size")
+plt.tight_layout()
+fig.savefig("euler_step_size_comparison.png", dpi=300, bbox_inches="tight")
+
+# Exact competition solution for the original parameters
+# a=1, b=2, c=1, d=3 and N_initial=[0.3, 0.6]
+t_exact = np.linspace(0, 100, 2001)
+N1_exact = 0.2 / (1 - np.exp(-t_exact) / 3)
+N_exact = np.column_stack((N1_exact, 2 * N1_exact))
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+for j in range(2):
+    axes[j].plot(
+        t_comp, N_comp[:, j],
+        label="Euler: dt = 1 yr"
+    )
+    axes[j].plot(
+        t_comp_small, N_comp_small[:, j],
+        label="Euler: dt = 0.1 yr"
+    )
+    axes[j].plot(
+        t_comp_rk, N_comp_rk[:, j],
+        "--", color="tab:green", label="RK45"
+    )
+    axes[j].plot(
+        t_exact, N_exact[:, j],
+        "k:", linewidth=2.5, label="Exact solution"
+    )
+
+    axes[j].set_title(f"Competition: Species {j + 1}")
+    axes[j].set_xlabel("Time (years)")
+    axes[j].set_ylabel("Population density")
+    axes[j].legend()
+    axes[j].grid(alpha=0.3)
+
+fig.suptitle("Competition: numerical methods versus exact solution")
+plt.tight_layout()
+fig.savefig("competition_exact_check.png", dpi=300, bbox_inches="tight")
+
+# Competition: vary initial populations, keeping coefficients fixed
+initial_cases = [
+    [0.3, 0.59],
+    [0.3, 0.61]
+]
+
+time_study = np.linspace(0, 100, 1001)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+for ax, initial in zip(axes, initial_cases):
+    time, population = rk45_solver(
+        competition, np.array(initial), time_study
+    )
+
+    ax.plot(time, population[:, 0], label="Species 1")
+    ax.plot(time, population[:, 1], label="Species 2")
+
+    ax.set_title(
+        f"Initial populations: N1 = {initial[0]}, N2 = {initial[1]}"
+    )
+    ax.set_xlabel("Time (years)")
+    ax.set_ylabel("Population density")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+fig.suptitle("Competition: effect of initial populations")
+plt.tight_layout()
+fig.savefig(
+    "competition_initial_conditions.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+# Weaker competition between species allows stable coexistence
+def competition_coexistence(t, N):
+    """Compute competition rates with weaker interspecies competition."""
+    return competition(t, N, a=1, b=0.5, c=1, d=0.5)
+
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+for ax, initial in zip(axes, initial_cases):
+    time, population = rk45_solver(
+        competition_coexistence, np.array(initial), time_study
+    )
+
+    ax.plot(time, population[:, 0], label="Species 1")
+    ax.plot(time, population[:, 1], label="Species 2")
+    ax.axhline(
+        2 / 3, color="black", linestyle=":",
+        label="Expected equilibrium: 2/3"
+    )
+
+    ax.set_title(
+        f"Initial populations: N1 = {initial[0]}, N2 = {initial[1]}"
+    )
+    ax.set_xlabel("Time (years)")
+    ax.set_ylabel("Population density")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+fig.suptitle("Stable coexistence: a = c = 1, b = d = 0.5")
+plt.tight_layout()
+fig.savefig(
+    "competition_stable_coexistence.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+# Competition: vary b while holding all other inputs fixed
+b_values = [0.25, 0.5, 1.5]
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
+
+for ax, b_value in zip(axes, b_values):
+
+    def competition_vary_b(t, N, b_value=b_value):
+        """Compute competition rates for the selected b value."""
+        return competition(t, N, a=1, b=b_value, c=1, d=0.5)
+
+    time, population = rk45_solver(
+        competition_vary_b,
+        np.array([0.3, 0.6]),
+        time_study
+    )
+
+    ax.plot(time, population[:, 0], label="Species 1")
+    ax.plot(time, population[:, 1], label="Species 2")
+
+    ax.set_title(f"b = {b_value}")
+    ax.set_xlabel("Time (years)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+axes[0].set_ylabel("Population density")
+fig.suptitle("Effect of b: a = c = 1, d = 0.5")
+plt.tight_layout()
+fig.savefig(
+    "competition_vary_b.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+# Competition: vary species 1's growth coefficient
+a_values = [0.25, 1, 2]
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
+
+for ax, a_value in zip(axes, a_values):
+
+    def competition_vary_a(t, N, a_value=a_value):
+        """Compute competition rates for the selected a value."""
+        return competition(t, N, a=a_value, b=0.5, c=1, d=0.5)
+
+    time, population = rk45_solver(
+        competition_vary_a,
+        np.array([0.3, 0.6]),
+        time_study
+    )
+
+    ax.plot(time, population[:, 0], label="Species 1")
+    ax.plot(time, population[:, 1], label="Species 2")
+
+    ax.set_title(f"a = {a_value}")
+    ax.set_xlabel("Time (years)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+axes[0].set_ylabel("Population density")
+fig.suptitle("Effect of a: b = d = 0.5, c = 1")
+plt.tight_layout()
+fig.savefig(
+    "competition_vary_a.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+# Competition: vary species 2's growth coefficient
+c_values = [0.25, 1, 2]
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
+
+for ax, c_value in zip(axes, c_values):
+
+    def competition_vary_c(t, N, c_value=c_value):
+        """Compute competition rates for the selected c value."""
+        return competition(t, N, a=1, b=0.5, c=c_value, d=0.5)
+
+    time, population = rk45_solver(
+        competition_vary_c,
+        np.array([0.3, 0.6]),
+        time_study
+    )
+
+    ax.plot(time, population[:, 0], label="Species 1")
+    ax.plot(time, population[:, 1], label="Species 2")
+
+    ax.set_title(f"c = {c_value}")
+    ax.set_xlabel("Time (years)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+axes[0].set_ylabel("Population density")
+fig.suptitle("Effect of c: a = 1, b = d = 0.5")
+plt.tight_layout()
+fig.savefig(
+    "competition_vary_c.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+# Competition: vary species 1's competitive effect on species 2
+d_values = [0.25, 0.5, 1.5]
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
+
+for ax, d_value in zip(axes, d_values):
+
+    def competition_vary_d(t, N, d_value=d_value):
+        """Compute competition rates for the selected d value."""
+        return competition(t, N, a=1, b=0.5, c=1, d=d_value)
+
+    time, population = rk45_solver(
+        competition_vary_d,
+        np.array([0.3, 0.6]),
+        time_study
+    )
+
+    ax.plot(time, population[:, 0], label="Species 1")
+    ax.plot(time, population[:, 1], label="Species 2")
+
+    ax.set_title(f"d = {d_value}")
+    ax.set_xlabel("Time (years)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+axes[0].set_ylabel("Population density")
+fig.suptitle("Effect of d: a = c = 1, b = 0.5")
+plt.tight_layout()
+fig.savefig(
+    "competition_vary_d.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+# Predator-prey: vary initial populations
+pred_initial_cases = [
+    [0.3, 0.6],
+    [0.5, 0.6],
+    [0.3, 0.9]
+]
+
+pred_time_study = np.linspace(0, 100, 5001)
+
+fig, axes = plt.subplots(3, 2, figsize=(13, 11))
+
+for row, initial in enumerate(pred_initial_cases):
+    time, population = rk45_solver(
+        predation, np.array(initial), pred_time_study
+    )
+
+    prey = population[:, 0]
+    predators = population[:, 1]
+
+    # Populations versus time
+    axes[row, 0].plot(time, prey, label="Prey")
+    axes[row, 0].plot(time, predators, label="Predators")
+    axes[row, 0].set_title(
+        f"Initial populations: prey = {initial[0]}, "
+        f"predators = {initial[1]}"
+    )
+    axes[row, 0].set_xlabel("Time (years)")
+    axes[row, 0].set_ylabel("Population density")
+
+    # Phase diagram
+    axes[row, 1].plot(prey, predators, label="Trajectory")
+    axes[row, 1].plot(
+        initial[0], initial[1], "go", label="Initial state"
+    )
+    axes[row, 1].plot(
+        1 / 3, 1 / 2, "kx", markersize=9,
+        label="Equilibrium"
+    )
+    axes[row, 1].set_title("Phase diagram")
+    axes[row, 1].set_xlabel("Prey population density")
+    axes[row, 1].set_ylabel("Predator population density")
+
+for ax in axes.flat:
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+fig.suptitle("Predator–prey: effect of initial populations")
+plt.tight_layout()
+fig.savefig(
+    "predation_initial_conditions.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+# Predator-prey: vary the prey growth coefficient
+pred_a_values = [0.5, 1, 2]
+
+fig, axes = plt.subplots(
+    3, 2, figsize=(13, 11),
+    sharex="col", sharey="col"
+)
+
+for row, a_value in enumerate(pred_a_values):
+
+    def predation_vary_a(t, N, a_value=a_value):
+        """Compute predator-prey rates for the selected a value."""
+        return predation(t, N, a=a_value, b=2, c=1, d=3)
+
+    time, population = rk45_solver(
+        predation_vary_a,
+        np.array([0.3, 0.6]),
+        pred_time_study
+    )
+
+    prey = population[:, 0]
+    predators = population[:, 1]
+
+    # Populations versus time
+    axes[row, 0].plot(time, prey, label="Prey")
+    axes[row, 0].plot(time, predators, label="Predators")
+    axes[row, 0].set_title(f"a = {a_value}")
+    axes[row, 0].set_xlabel("Time (years)")
+    axes[row, 0].set_ylabel("Population density")
+
+    # Phase diagram and equilibrium for this coefficient
+    axes[row, 1].plot(prey, predators, label="Trajectory")
+    axes[row, 1].plot(0.3, 0.6, "go", label="Initial state")
+    axes[row, 1].plot(
+        1 / 3, a_value / 2,
+        "kx", markersize=9, label="Equilibrium"
+    )
+    axes[row, 1].set_title(f"Phase diagram: a = {a_value}")
+    axes[row, 1].set_xlabel("Prey population density")
+    axes[row, 1].set_ylabel("Predator population density")
+
+for ax in axes.flat:
+    ax.legend(loc="upper right")
+    ax.grid(alpha=0.3)
+
+fig.suptitle("Predator–prey: effect of a")
+plt.tight_layout()
+fig.savefig(
+    "predation_vary_a.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+# Predator-prey: study b, c, and d separately
+parameter_studies = {
+    "b": [1, 2, 4],
+    "c": [0.5, 1, 2],
+    "d": [1.5, 3, 6]
+}
+
+baseline_parameters = {
+    "a": 1,
+    "b": 2,
+    "c": 1,
+    "d": 3
+}
+
+pred_initial = np.array([0.3, 0.6])
+
+for parameter, values in parameter_studies.items():
+    fig, axes = plt.subplots(
+        3, 2, figsize=(13, 11),
+        sharex="col", sharey="col"
+    )
+
+    for row, value in enumerate(values):
+        # Change only the coefficient being studied
+        parameters = baseline_parameters.copy()
+        parameters[parameter] = value
+
+        def predation_case(t, N, parameters=parameters):
+            """Compute predator-prey rates for this parameter set."""
+            return predation(t, N, **parameters)
+
+        time, population = rk45_solver(
+            predation_case,
+            pred_initial,
+            pred_time_study
+        )
+
+        prey = population[:, 0]
+        predators = population[:, 1]
+
+        # Equilibrium for the current coefficients
+        prey_equilibrium = parameters["c"] / parameters["d"]
+        predator_equilibrium = parameters["a"] / parameters["b"]
+
+        # Populations versus time
+        axes[row, 0].plot(time, prey, label="Prey")
+        axes[row, 0].plot(time, predators, label="Predators")
+        axes[row, 0].set_title(f"{parameter} = {value}")
+        axes[row, 0].set_xlabel("Time (years)")
+        axes[row, 0].set_ylabel("Population density")
+
+        # Phase diagram
+        axes[row, 1].plot(prey, predators, label="Trajectory")
+        axes[row, 1].plot(
+            pred_initial[0], pred_initial[1],
+            "go", label="Initial state"
+        )
+        axes[row, 1].plot(
+            prey_equilibrium, predator_equilibrium,
+            "kx", markersize=9, label="Equilibrium"
+        )
+        axes[row, 1].set_title(
+            f"Phase diagram: {parameter} = {value}"
+        )
+        axes[row, 1].set_xlabel("Prey population density")
+        axes[row, 1].set_ylabel("Predator population density")
+
+    for ax in axes.flat:
+        ax.legend(loc="upper right")
+        ax.grid(alpha=0.3)
+
+    fixed_parameters = ", ".join(
+        f"{key} = {val}"
+        for key, val in baseline_parameters.items()
+        if key != parameter
+    )
+
+    fig.suptitle(
+        f"Predator–prey: effect of {parameter}\n"
+        f"Fixed: {fixed_parameters}"
+    )
+    fig.tight_layout()
+    fig.savefig(
+        f"predation_vary_{parameter}.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+# Lorenz model
+def lorenz(t, state, sigma=10, b=8 / 3, r=23):
+    """
+    Compute the Lorenz rates of change.
+
+    t: Time in model units.
+    state: Current values [x, y, z].
+    sigma, b, r: Lorenz model parameters.
+    """
+    x, y, z = state
+
+    dx_dt = sigma * (y - x)
+    dy_dt = x * (r - z) - y
+    dz_dt = x * y - b * z
+
+    return np.array([dx_dt, dy_dt, dz_dt])
+
+
+# Initial conditions differ by 10^-5 in every component
+lorenz_initial = np.array([1.0, 1.0, 1.0])
+lorenz_perturbed = lorenz_initial + 1e-5
+lorenz_time = np.linspace(0, 100, 10001)
+
+t_lorenz23, state23 = rk45_solver(
+    lorenz, lorenz_initial, lorenz_time
+)
+
+_, state23_perturbed = rk45_solver(
+    lorenz, lorenz_perturbed, lorenz_time
+)
+
+# Distance between the two trajectories in (x, y, z) space
+separation23 = np.linalg.norm(
+    state23_perturbed - state23, axis=1
+)
+
+print("\nLorenz r = 23, final [x, y, z]:")
+print("Original:", state23[-1])
+print("Perturbed:", state23_perturbed[-1])
+print("Final separation:", separation23[-1])
+
+fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+axes[0].plot(t_lorenz23, state23[:, 0], label="Original")
+axes[0].plot(
+    t_lorenz23, state23_perturbed[:, 0],
+    "--", label="Perturbed"
+)
+axes[0].set_ylabel("x")
+axes[0].set_title("Original and perturbed x trajectories")
+axes[0].legend()
+
+axes[1].semilogy(t_lorenz23, separation23)
+axes[1].set_xlabel("Time (model units)")
+axes[1].set_ylabel("Trajectory separation")
+axes[1].set_title("Distance between the two solutions")
+
+for ax in axes:
+    ax.grid(alpha=0.3)
+
+fig.suptitle("Lorenz sensitivity: r = 23")
+plt.tight_layout()
+fig.savefig(
+    "lorenz_r23_sensitivity.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+# Lorenz: repeat the sensitivity experiment with r = 25
+def lorenz_r25(t, state):
+    """Compute Lorenz rates with r = 25."""
+    return lorenz(t, state, r=25)
+
+
+t_lorenz25, state25 = rk45_solver(
+    lorenz_r25, lorenz_initial, lorenz_time
+)
+
+_, state25_perturbed = rk45_solver(
+    lorenz_r25, lorenz_perturbed, lorenz_time
+)
+
+# Distance between original and perturbed trajectories
+separation25 = np.linalg.norm(
+    state25_perturbed - state25, axis=1
+)
+
+print("\nLorenz r = 25, final [x, y, z]:")
+print("Original:", state25[-1])
+print("Perturbed:", state25_perturbed[-1])
+print("Final separation:", separation25[-1])
+
+fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+axes[0].plot(t_lorenz25, state25[:, 0], label="Original")
+axes[0].plot(
+    t_lorenz25, state25_perturbed[:, 0],
+    "--", label="Perturbed"
+)
+axes[0].set_ylabel("x")
+axes[0].set_title("Original and perturbed x trajectories")
+axes[0].legend()
+
+axes[1].semilogy(t_lorenz25, separation25)
+axes[1].set_xlabel("Time (model units)")
+axes[1].set_ylabel("Trajectory separation")
+axes[1].set_title("Distance between the two solutions")
+
+for ax in axes:
+    ax.grid(alpha=0.3)
+
+fig.suptitle("Lorenz sensitivity: r = 25")
+plt.tight_layout()
+fig.savefig(
+    "lorenz_r25_sensitivity.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+# Lorenz: multiple initial conditions and solver accuracy checks
+lorenz_initial_cases = [
+    [1.0, 1.0, 1.0],
+    [2.0, 3.0, 4.0],
+    [-5.0, 5.0, 15.0]
+]
+
+# Relative and absolute error tolerances
+accuracy_settings = [
+    ("Original", 1e-8, 1e-10),
+    ("Tighter", 1e-10, 1e-12),
+    ("Tightest", 1e-12, 1e-14)
+]
+
+lorenz_check_time = np.linspace(0, 100, 10001)
+lorenz_records = []
+
+
+def solve_lorenz_case(initial, r_value, rtol, atol):
+    """Solve one Lorenz case with specified accuracy tolerances."""
+
+    def rates(t, state):
+        return lorenz(t, state, r=r_value)
+
+    solution = solve_ivp(
+        rates,
+        (0, 100),
+        initial,
+        method="RK45",
+        t_eval=lorenz_check_time,
+        rtol=rtol,
+        atol=atol
+    )
+
+    if not solution.success:
+        raise RuntimeError(solution.message)
+
+    return solution.y.T
+
+
+for r_value in [23, 25]:
+    fig, axes = plt.subplots(
+        len(lorenz_initial_cases), 2,
+        figsize=(14, 12),
+        sharex=True
+    )
+
+    for row, initial in enumerate(lorenz_initial_cases):
+        initial = np.array(initial, dtype=float)
+        perturbed_initial = initial + 1e-5
+
+        results = {}
+
+        # Repeat each pair using all three tolerance settings
+        for label, rtol, atol in accuracy_settings:
+            original = solve_lorenz_case(
+                initial, r_value, rtol, atol
+            )
+            perturbed = solve_lorenz_case(
+                perturbed_initial, r_value, rtol, atol
+            )
+
+            separation = np.linalg.norm(
+                perturbed - original, axis=1
+            )
+
+            results[label] = (original, perturbed, separation)
+
+        # Plot trajectories using the tightest tolerances
+        reference, reference_perturbed, _ = results["Tightest"]
+
+        axes[row, 0].plot(
+            lorenz_check_time, reference[:, 0],
+            label="Original initial state"
+        )
+        axes[row, 0].plot(
+            lorenz_check_time, reference_perturbed[:, 0],
+            "--", label="Perturbed initial state", alpha=0.8
+        )
+        axes[row, 0].set_title(
+            f"Initial state: {initial.tolist()}"
+        )
+        axes[row, 0].set_ylabel("x")
+
+        # Compare separation curves across solver tolerances
+        for label, rtol, atol in accuracy_settings:
+            original, perturbed, separation = results[label]
+
+            # Floor only for logarithmic plotting if a value is zero
+            axes[row, 1].semilogy(
+                lorenz_check_time,
+                np.maximum(separation, 1e-16),
+                label=f"{label}: rtol={rtol:.0e}"
+            )
+
+            # Compare identical initial conditions across tolerances.
+            # This measures numerical differences, not perturbation growth.
+            original_error = np.linalg.norm(
+                original - reference, axis=1
+            )
+            perturbed_error = np.linalg.norm(
+                perturbed - reference_perturbed, axis=1
+            )
+
+            early = lorenz_check_time <= 10
+            early_difference = max(
+                np.max(original_error[early]),
+                np.max(perturbed_error[early])
+            )
+
+            # Store final states and validation information
+            lorenz_records.append({
+                "r": r_value,
+                "x0": initial[0],
+                "y0": initial[1],
+                "z0": initial[2],
+                "accuracy": label,
+                "rtol": rtol,
+                "atol": atol,
+                "x_at_100": original[-1, 0],
+                "y_at_100": original[-1, 1],
+                "z_at_100": original[-1, 2],
+                "perturbed_x_at_100": perturbed[-1, 0],
+                "perturbed_y_at_100": perturbed[-1, 1],
+                "perturbed_z_at_100": perturbed[-1, 2],
+                "separation_at_100": separation[-1],
+                "max_difference_from_tightest_through_t10":
+                    early_difference
+            })
+
+        axes[row, 1].set_title(
+            "Initial-condition separation at each tolerance"
+        )
+        axes[row, 1].set_ylabel("Trajectory separation")
+
+    for ax in axes.flat:
+        ax.set_xlabel("Time (model units)")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+
+    fig.suptitle(
+        f"Lorenz: initial conditions and accuracy checks, r = {r_value}"
+    )
+    fig.tight_layout()
+    fig.savefig(
+        f"lorenz_r{r_value}_initial_conditions_accuracy.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+
+# Save final x, y, z values and accuracy-check results
+with open(
+    "lorenz_validation_results.csv",
+    "w",
+    newline="",
+    encoding="utf-8"
+) as output_file:
+    writer = csv.DictWriter(
+        output_file,
+        fieldnames=list(lorenz_records[0].keys())
+    )
+    writer.writeheader()
+    writer.writerows(lorenz_records)
+
+print("\nLorenz experiments completed.")
+print("Saved both comparison figures and lorenz_validation_results.csv")
+
+plt.show()
