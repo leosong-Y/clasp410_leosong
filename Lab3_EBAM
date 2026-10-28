@@ -1,0 +1,834 @@
+"""
+Lab 3: N-layer atmosphere model
+
+Assumptions:
+    The surface is a perfect infrared blackbody.
+    Atmospheric layers have uniform infrared emissivity.
+    Infrared absorptivity equals emissivity.
+    Infrared radiation not absorbed is transmitted.
+    Normally, absorbed sunlight heats the surface.
+    During nuclear winter, absorbed sunlight heats the top layer.
+    Physical layer heights are unspecified, so profiles use layer number.
+    Albedo is assumed to be 0.3 for Earth and Venus.
+"""
+
+from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ============================================================
+# SETTINGS: change experimental parameters here.
+# ============================================================
+
+SIGMA = 5.6703e-8                # W m^-2 K^-4
+KELVIN_OFFSET = 273.15           # Celsius = kelvin - this value
+
+EARTH_S0 = 1350.0                # W/m^2
+EARTH_ALBEDO = 0.3               # Assumed
+EARTH_TARGET = 288.0             # K
+EARTH_EMISSIVITY = 0.255
+EARTH_MAX_LAYERS = 4
+EMISSIVITY_SAMPLES = 201
+
+VENUS_S0 = 2600.0                # W/m^2
+VENUS_ALBEDO = 0.3               # Assumed
+VENUS_TARGET = 700.0             # K
+VENUS_EMISSIVITY = 1.0
+VENUS_PLOT_MARGIN = 3            # Extra layer counts around the estimate.
+
+WINTER_LAYERS = 5
+WINTER_EMISSIVITY = 0.5
+
+DEBUG = False
+SHOW_PLOTS = True
+FIGURE_DPI = 300
+TEST_RTOL = 1e-9
+TEST_ATOL = 1e-9
+
+OUTPUT_DIR = Path(__file__).resolve().parent / "lab3_results"
+
+# Colorblind-friendly colors; markers and line styles also differ.
+BLUE = "#0072B2"
+ORANGE = "#D55E00"
+
+plt.rcParams.update({
+    "font.size": 11,
+    "axes.titlesize": 12,
+    "axes.labelsize": 11,
+    "legend.fontsize": 10,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "lines.linewidth": 2,
+    "lines.markersize": 7,
+})
+
+# ============================================================
+# QUESTION 2: MODEL FUNCTION
+# ============================================================
+
+def n_layer_atmosphere(
+    nlayers,
+    S0=EARTH_S0,
+    emissivity=1.0,
+    albedo=EARTH_ALBEDO,
+    debug=False,
+    nuclear_winter=False,
+):
+    """
+    Calculate equilibrium surface and atmospheric temperatures.
+
+    nlayers : int
+        Number of atmospheric layers; must be nonnegative.
+    S0 : float
+        Solar irradiance in W/m^2; must be finite and nonnegative.
+    emissivity : float
+        Infrared emissivity of every atmospheric layer, from 0 to 1.
+        Surface infrared emissivity is always 1.
+    albedo : float
+        Fraction of incoming sunlight reflected, from 0 to 1.
+    debug : bool
+        If True, print the coefficient matrix, heating vector,
+        emitted fluxes, and temperatures.
+    nuclear_winter : bool
+        If True, deposit absorbed sunlight in the top atmospheric
+        layer. Otherwise, deposit it at the surface.
+
+    Returns
+
+    temperatures : numpy.ndarray
+        Temperatures in kelvin, ordered:
+        [surface, layer 1, ..., top layer].
+
+        At zero emissivity, atmospheric temperatures are undefined
+        by this radiative model and are returned as NaN.
+
+    """
+    # Validate inputs before constructing arrays.
+    if (
+        isinstance(nlayers, bool)
+        or not isinstance(nlayers, (int, np.integer))
+        or nlayers < 0
+    ):
+        raise ValueError("nlayers must be a nonnegative integer.")
+
+    if not np.isfinite(S0) or S0 < 0:
+        raise ValueError("S0 must be finite and nonnegative.")
+
+    if not 0 <= emissivity <= 1:
+        raise ValueError("emissivity must be between 0 and 1.")
+
+    if not 0 <= albedo <= 1:
+        raise ValueError("albedo must be between 0 and 1.")
+
+    if nuclear_winter and (nlayers < 1 or emissivity == 0):
+        raise ValueError(
+            "Nuclear winter requires at least one atmospheric "
+            "layer and positive infrared emissivity."
+        )
+
+    absorbed_solar = S0 * (1 - albedo) / 4
+    transmission = 1 - emissivity
+
+    # A transparent atmosphere does not exchange infrared energy.
+    # Its temperature cannot be determined by this model.
+    if emissivity == 0:
+        temperatures = np.full(nlayers + 1, np.nan)
+        temperatures[0] = (absorbed_solar / SIGMA) ** 0.25
+
+        if debug:
+            print("Transparent atmosphere: atmospheric temperatures are NaN.")
+            print("Temperatures (K):", temperatures)
+
+        return temperatures
+
+    # Construct the matrix and the external heating vector.
+    A = np.zeros((nlayers + 1, nlayers + 1))
+    b = np.zeros(nlayers + 1)
+
+    if nuclear_winter:
+        b[nlayers] = absorbed_solar
+    else:
+        b[0] = absorbed_solar
+
+    for i in range(nlayers + 1):
+        for j in range(nlayers + 1):
+            if i == j:
+                # Surface emits upward; atmospheric layers emit both ways.
+                A[i, j] = 1 if i == 0 else 2
+
+            elif i == 0:
+                # Atmospheric radiation reaching the blackbody surface.
+                A[i, j] = -transmission ** (j - 1)
+
+            elif j == 0:
+                # Surface radiation absorbed by atmospheric layer i.
+                A[i, j] = (
+                    -emissivity * transmission ** (i - 1)
+                )
+
+            else:
+                # Radiation exchanged between atmospheric layers.
+                intervening_layers = abs(i - j) - 1
+                A[i, j] = (
+                    -emissivity
+                    * transmission ** intervening_layers
+                )
+
+    # Solve for emitted infrared fluxes, then convert to kelvin.
+    fluxes = np.linalg.solve(A, b)
+
+    emission_factors = np.full(nlayers + 1, float(emissivity))
+    emission_factors[0] = 1.0
+
+    temperatures = (
+        fluxes / (SIGMA * emission_factors)
+    ) ** 0.25
+
+    if debug:
+        print("\nCoefficient matrix A:\n", A)
+        print("Solar heating vector b (W/m^2):", b)
+        print("Emitted fluxes (W/m^2):", fluxes)
+        print("Temperatures (K):", temperatures)
+
+    return temperatures
+
+
+def outgoing_radiation(temperatures, emissivity):
+    """
+    Calculate total infrared radiation escaping to space.
+
+    Parameters
+    ----------
+    temperatures : array-like
+        Temperatures in kelvin, ordered surface to top.
+    emissivity : float
+        Uniform atmospheric infrared emissivity, greater than zero.
+
+    Returns
+    -------
+    float
+        Upward infrared flux reaching space in W/m^2.
+    """
+    temperatures = np.asarray(temperatures)
+    nlayers = len(temperatures) - 1
+    transmission = 1 - emissivity
+
+    # Surface radiation must pass through every atmospheric layer.
+    outgoing = (
+        SIGMA * temperatures[0]**4 * transmission**nlayers
+    )
+
+    # Radiation from layer i passes through the layers above it.
+    for i in range(1, nlayers + 1):
+        outgoing += (
+            emissivity
+            * SIGMA
+            * temperatures[i]**4
+            * transmission**(nlayers - i)
+        )
+
+    return float(outgoing)
+
+
+# ============================================================
+# QUESTION 2: VALIDATION TESTS
+# ============================================================
+
+def validate_model():
+    """
+    Test analytical solutions, energy conservation, and edge cases.
+
+    Returns
+    -------
+    list of str
+        Descriptions of successful checks.
+
+    Raises
+    ------
+    AssertionError
+        If a numerical result does not match its expected value.
+    """
+    messages = []
+    absorbed_solar = EARTH_S0 * (1 - EARTH_ALBEDO) / 4
+
+    # Expected blackbody result:
+    # F_i = (N + 1 - i) * absorbed_solar.
+    # This also tests the zero-layer, atmosphere-free case.
+    for n in range(EARTH_MAX_LAYERS + 1):
+        calculated = n_layer_atmosphere(
+            n, EARTH_S0, 1.0, EARTH_ALBEDO
+        )
+        expected_fluxes = (
+            np.arange(n + 1, 0, -1) * absorbed_solar
+        )
+        expected = (expected_fluxes / SIGMA) ** 0.25
+
+        np.testing.assert_allclose(
+            calculated, expected,
+            rtol=TEST_RTOL, atol=TEST_ATOL,
+        )
+
+    messages.append(
+        "PASS: blackbody temperature profiles, including no atmosphere."
+    )
+
+    # Expected single-layer graybody result:
+    # Ts^4 = Q / [sigma * (1 - emissivity / 2)].
+    # The atmospheric temperature equals Ts / 2^(1/4).
+    for e in (EARTH_EMISSIVITY, WINTER_EMISSIVITY):
+        calculated = n_layer_atmosphere(
+            1, EARTH_S0, e, EARTH_ALBEDO
+        )
+        surface = (
+            absorbed_solar / (SIGMA * (1 - e / 2))
+        ) ** 0.25
+        expected = [surface, surface / 2**0.25]
+
+        np.testing.assert_allclose(
+            calculated, expected,
+            rtol=TEST_RTOL, atol=TEST_ATOL,
+        )
+
+    messages.append("PASS: single-layer graybody analytical solutions.")
+
+    # In both heating scenarios, outgoing infrared radiation should
+    # equal globally averaged absorbed sunlight.
+    for winter in (False, True):
+        temperatures = n_layer_atmosphere(
+            WINTER_LAYERS,
+            EARTH_S0,
+            WINTER_EMISSIVITY,
+            EARTH_ALBEDO,
+            nuclear_winter=winter,
+        )
+        outgoing = outgoing_radiation(
+            temperatures, WINTER_EMISSIVITY
+        )
+
+        np.testing.assert_allclose(
+            outgoing, absorbed_solar,
+            rtol=TEST_RTOL, atol=TEST_ATOL,
+        )
+
+    messages.append(
+        "PASS: energy conservation for normal and nuclear winter cases."
+    )
+
+    # For top-layer solar heating, the analytical profile has
+    # equal temperatures below the top layer.
+    winter_temperatures = n_layer_atmosphere(
+        WINTER_LAYERS,
+        EARTH_S0,
+        WINTER_EMISSIVITY,
+        EARTH_ALBEDO,
+        nuclear_winter=True,
+    )
+    lower_temperature = (
+        absorbed_solar / (SIGMA * (2 - WINTER_EMISSIVITY))
+    ) ** 0.25
+    top_temperature = (
+        absorbed_solar
+        / (
+            SIGMA
+            * WINTER_EMISSIVITY
+            * (2 - WINTER_EMISSIVITY)
+        )
+    ) ** 0.25
+
+    expected = np.full(WINTER_LAYERS + 1, lower_temperature)
+    expected[-1] = top_temperature
+
+    np.testing.assert_allclose(
+        winter_temperatures, expected,
+        rtol=TEST_RTOL, atol=TEST_ATOL,
+    )
+    messages.append("PASS: nuclear winter analytical temperature profile.")
+
+    # Zero emissivity should reproduce the atmosphere-free surface
+    # temperature while leaving atmospheric temperatures undefined.
+    transparent = n_layer_atmosphere(
+        EARTH_MAX_LAYERS,
+        EARTH_S0,
+        0.0,
+        EARTH_ALBEDO,
+    )
+    np.testing.assert_allclose(
+        transparent[0],
+        (absorbed_solar / SIGMA) ** 0.25,
+        rtol=TEST_RTOL, atol=TEST_ATOL,
+    )
+    if not np.all(np.isnan(transparent[1:])):
+        raise AssertionError(
+            "Transparent atmospheric temperatures should be NaN."
+        )
+
+    messages.append("PASS: zero-emissivity boundary case.")
+    return messages
+
+
+# ============================================================
+# OUTPUT HELPERS
+# ============================================================
+
+def save_figure(fig, filename):
+    """
+    Save a Matplotlib figure as a high-resolution PNG.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        Figure to save.
+    filename : str
+        Output filename within OUTPUT_DIR.
+
+    Returns
+    -------
+    None
+    """
+    fig.tight_layout()
+    fig.savefig(
+        OUTPUT_DIR / filename,
+        dpi=FIGURE_DPI,
+        bbox_inches="tight",
+    )
+
+
+def save_table(filename, columns, header):
+    """
+    Save numeric columns as a CSV table.
+
+    Parameters
+    ----------
+    filename : str
+        Output filename within OUTPUT_DIR.
+    columns : sequence of array-like
+        Equal-length columns to save.
+    header : str
+        Comma-separated column names, including units where applicable.
+
+    Returns
+    -------
+    None
+    """
+    np.savetxt(
+        OUTPUT_DIR / filename,
+        np.column_stack(columns),
+        delimiter=",",
+        header=header,
+        comments="",
+        fmt="%.8f",
+    )
+
+
+# ============================================================
+# QUESTION 3: EARTH EXPERIMENTS
+# ============================================================
+
+def earth_experiments():
+    """
+    Explore Earth's dependence on emissivity and layer count.
+
+    Saves Figures 1–3 and the corresponding numerical data.
+
+    Returns
+    -------
+    str
+        Results and interpretation for the summary file.
+    """
+    # Experiment A: one atmospheric layer, varying emissivity.
+    emissivities = np.linspace(0, 1, EMISSIVITY_SAMPLES)
+    surface_temperatures = np.array([
+        n_layer_atmosphere(
+            1, EARTH_S0, e, EARTH_ALBEDO
+        )[0]
+        for e in emissivities
+    ])
+
+    # Refine the plotted estimate with the single-layer formula.
+    absorbed_solar = EARTH_S0 * (1 - EARTH_ALBEDO) / 4
+    target_emissivity = 2 * (
+        1 - absorbed_solar / (SIGMA * EARTH_TARGET**4)
+    )
+
+    if not 0 <= target_emissivity <= 1:
+        raise ValueError(
+            "The Earth target temperature cannot be reached "
+            "with one layer and the selected solar flux and albedo."
+        )
+
+    # Confirm the inferred emissivity using the numerical model.
+    matched_temperature = n_layer_atmosphere(
+        1, EARTH_S0, target_emissivity, EARTH_ALBEDO
+    )[0]
+    np.testing.assert_allclose(
+        matched_temperature, EARTH_TARGET,
+        rtol=TEST_RTOL, atol=TEST_ATOL,
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(
+        emissivities, surface_temperatures,
+        color=BLUE, label="One-layer model",
+    )
+    ax.axhline(
+        EARTH_TARGET, color="black", linestyle="--",
+        label=f"Target: {EARTH_TARGET:g} K",
+    )
+    ax.plot(
+        target_emissivity, matched_temperature,
+        marker="o", linestyle="none", color=ORANGE,
+        label=f"Matching emissivity: {target_emissivity:.3f}",
+    )
+    ax.set(
+        xlabel="Atmospheric infrared emissivity",
+        ylabel="Surface temperature (K)",
+        title=(
+            "Figure 1. Earth: effect of emissivity\n"
+            f"S₀ = {EARTH_S0:g} W/m²; albedo = {EARTH_ALBEDO:g}"
+        ),
+    )
+    ax.grid(alpha=0.3)
+    ax.legend()
+    save_figure(fig, "figure_1_earth_emissivity.png")
+
+    save_table(
+        "earth_emissivity.csv",
+        [emissivities, surface_temperatures],
+        "emissivity,surface_temperature_K",
+    )
+
+    # Experiment B: fixed emissivity, varying layer count.
+    layer_counts = np.arange(1, EARTH_MAX_LAYERS + 1)
+    layer_temperatures = np.array([
+        n_layer_atmosphere(
+            int(n), EARTH_S0, EARTH_EMISSIVITY, EARTH_ALBEDO
+        )[0]
+        for n in layer_counts
+    ])
+
+    closest_index = np.argmin(
+        np.abs(layer_temperatures - EARTH_TARGET)
+    )
+    best_layers = int(layer_counts[closest_index])
+
+    # Supplementary figure: directly displays the layer-count experiment.
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(
+        layer_counts, layer_temperatures,
+        "o-", color=BLUE,
+        label=f"Emissivity = {EARTH_EMISSIVITY:g}",
+    )
+    ax.axhline(
+        EARTH_TARGET, color="black", linestyle="--",
+        label=f"Target: {EARTH_TARGET:g} K",
+    )
+    ax.set(
+        xlabel="Number of atmospheric layers",
+        ylabel="Surface temperature (K)",
+        title="Figure 2. Earth: effect of layer count",
+        xticks=layer_counts,
+    )
+    ax.grid(alpha=0.3)
+    ax.legend()
+    save_figure(fig, "figure_2_earth_layer_count.png")
+
+    save_table(
+        "earth_layer_count.csv",
+        [layer_counts, layer_temperatures],
+        "atmospheric_layers,surface_temperature_K",
+    )
+
+    # Profile for the model closest to the target in the tested range.
+    profile = n_layer_atmosphere(
+        best_layers, EARTH_S0, EARTH_EMISSIVITY, EARTH_ALBEDO
+    )
+    levels = np.arange(best_layers + 1)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.plot(
+        profile, levels, "o-", color=BLUE,
+        label=f"{best_layers} atmospheric layers",
+    )
+    ax.set(
+        xlabel="Temperature (K)",
+        ylabel="Layer number (0 = surface)",
+        title=(
+            "Figure 3. Earth temperature profile\n"
+            f"Emissivity = {EARTH_EMISSIVITY:g}; "
+            f"albedo = {EARTH_ALBEDO:g}"
+        ),
+        yticks=levels,
+    )
+    ax.grid(alpha=0.3)
+    ax.legend()
+    save_figure(fig, "figure_3_earth_profile.png")
+
+    save_table(
+        "earth_profile.csv",
+        [levels, profile],
+        "level,surface_or_layer_temperature_K",
+    )
+
+    rows = "\n".join(
+        f"  {n} layers: {temperature:.2f} K"
+        for n, temperature in zip(layer_counts, layer_temperatures)
+    )
+
+    return (
+        "QUESTION 3: EARTH\n"
+        f"The assumed albedo is {EARTH_ALBEDO:g}.\n"
+        f"Figure 1 shows that a one-layer atmosphere requires emissivity "
+        f"{target_emissivity:.4f} to reach {EARTH_TARGET:g} K.\n"
+        f"At fixed emissivity {EARTH_EMISSIVITY:g}, the results are:\n"
+        f"{rows}\n"
+        f"Figure 2 shows increasing surface temperature with layer count. "
+        f"The closest result among 1–{EARTH_MAX_LAYERS} layers is "
+        f"{best_layers} layers, giving {profile[0]:.2f} K. "
+        f"This differs from the target by "
+        f"{profile[0] - EARTH_TARGET:+.2f} K.\n"
+        f"Figure 3 shows the selected model's temperature profile. "
+        "Layer number represents vertical position because physical "
+        "altitudes are not supplied.\n"
+    )
+
+
+# ============================================================
+# QUESTION 4: VENUS
+# ============================================================
+
+def venus_experiment():
+    """
+    Find the integer number of blackbody layers nearest Venus's target.
+
+    Saves Figure 4 and a table of nearby model results.
+
+    Returns
+    -------
+    str
+        Layer estimate, temperatures, and assumptions.
+    """
+    absorbed_solar = VENUS_S0 * (1 - VENUS_ALBEDO) / 4
+
+    if absorbed_solar <= 0:
+        raise ValueError(
+            "The Venus experiment requires positive absorbed sunlight."
+        )
+
+    continuous_layers = (
+        SIGMA * VENUS_TARGET**4 / absorbed_solar - 1
+    )
+
+    # Include the two bracketing integer solutions and nearby values.
+    # The assignment specifies N > 1.
+    lower = max(
+        2, int(np.floor(continuous_layers)) - VENUS_PLOT_MARGIN
+    )
+    upper = max(
+        lower + 1,
+        int(np.ceil(continuous_layers)) + VENUS_PLOT_MARGIN,
+    )
+    layer_counts = np.arange(lower, upper + 1)
+
+    surface_temperatures = np.array([
+        n_layer_atmosphere(
+            int(n), VENUS_S0, VENUS_EMISSIVITY, VENUS_ALBEDO
+        )[0]
+        for n in layer_counts
+    ])
+
+    closest_index = np.argmin(
+        np.abs(surface_temperatures - VENUS_TARGET)
+    )
+    best_layers = int(layer_counts[closest_index])
+    best_temperature = surface_temperatures[closest_index]
+
+    # Supplementary figure: supports the selected integer layer count.
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(
+        layer_counts, surface_temperatures,
+        "o-", color=BLUE, label="Perfectly absorbing layers",
+    )
+    ax.axhline(
+        VENUS_TARGET, color="black", linestyle="--",
+        label=f"Target: {VENUS_TARGET:g} K",
+    )
+    ax.plot(
+        best_layers, best_temperature,
+        marker="s", linestyle="none", color=ORANGE,
+        label=f"Closest model: {best_layers} layers",
+    )
+    ax.set(
+        xlabel="Number of atmospheric layers",
+        ylabel="Surface temperature (K)",
+        title=(
+            "Figure 4. Venus: effect of layer count\n"
+            f"S₀ = {VENUS_S0:g} W/m²; "
+            f"assumed albedo = {VENUS_ALBEDO:g}"
+        ),
+        xticks=layer_counts,
+    )
+    ax.grid(alpha=0.3)
+    ax.legend()
+    save_figure(fig, "figure_4_venus_layers.png")
+
+    save_table(
+        "venus_layer_count.csv",
+        [layer_counts, surface_temperatures],
+        "atmospheric_layers,surface_temperature_K",
+    )
+
+    return (
+        "QUESTION 4: VENUS\n"
+        f"Using assumed albedo {VENUS_ALBEDO:g}, the continuous "
+        f"blackbody-layer estimate is {continuous_layers:.2f}.\n"
+        f"The closest integer model with N > 1 has {best_layers} layers "
+        f"and a surface temperature of {best_temperature:.2f} K, "
+        f"as shown in Figure 4.\n"
+        "The layer estimate depends on the assumed albedo. These are "
+        "idealized radiative layers, not physical atmospheric regions.\n"
+    )
+
+
+# ============================================================
+# QUESTION 5: NUCLEAR WINTER
+# ============================================================
+
+def nuclear_winter_experiment():
+    """
+    Compare top-layer and surface solar heating for identical parameters.
+
+    Saves Figure 5 and both temperature profiles.
+
+    Returns
+    -------
+    str
+        Nuclear winter temperatures and their interpretation.
+    """
+    winter_profile = n_layer_atmosphere(
+        WINTER_LAYERS,
+        EARTH_S0,
+        WINTER_EMISSIVITY,
+        EARTH_ALBEDO,
+        debug=DEBUG,
+        nuclear_winter=True,
+    )
+
+    # Reference model: identical parameters, sunlight heats the surface.
+    normal_profile = n_layer_atmosphere(
+        WINTER_LAYERS,
+        EARTH_S0,
+        WINTER_EMISSIVITY,
+        EARTH_ALBEDO,
+    )
+
+    levels = np.arange(WINTER_LAYERS + 1)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(
+        winter_profile, levels, "o-", color=BLUE,
+        label="Nuclear winter: sunlight heats top layer",
+    )
+    ax.plot(
+        normal_profile, levels, "s--", color=ORANGE,
+        label="Reference: sunlight heats surface",
+    )
+    ax.set(
+        xlabel="Temperature (K)",
+        ylabel="Layer number (0 = surface)",
+        title=(
+            "Figure 5. Effect of top-layer solar absorption\n"
+            f"{WINTER_LAYERS} layers; "
+            f"emissivity = {WINTER_EMISSIVITY:g}; "
+            f"albedo = {EARTH_ALBEDO:g}"
+        ),
+        yticks=levels,
+    )
+    ax.grid(alpha=0.3)
+    ax.legend()
+    save_figure(fig, "figure_5_nuclear_winter.png")
+
+    save_table(
+        "nuclear_winter_profiles.csv",
+        [levels, winter_profile, normal_profile],
+        "level,nuclear_winter_temperature_K,reference_temperature_K",
+    )
+
+    profile_rows = "\n".join(
+        f"  Level {level}: {temperature:.2f} K"
+        for level, temperature in zip(levels, winter_profile)
+    )
+
+    return (
+        "QUESTION 5: NUCLEAR WINTER\n"
+        "The albedo is retained, and all absorbed sunlight is deposited "
+        "in the top atmospheric layer. No sunlight heats the surface.\n"
+        f"The surface temperature is {winter_profile[0]:.2f} K "
+        f"({winter_profile[0] - KELVIN_OFFSET:.2f} degrees Celsius).\n"
+        f"The reference surface temperature with the same parameters "
+        f"is {normal_profile[0]:.2f} K.\n"
+        f"Nuclear winter profile, with level 0 denoting the surface:\n"
+        f"{profile_rows}\n"
+        "Figure 5 shows that the top layer becomes warmest when it "
+        "absorbs sunlight. The surface is heated only by downward "
+        "infrared radiation. The uniform temperatures below the top "
+        "layer follow from this idealized radiative equilibrium model.\n"
+    )
+
+
+# ============================================================
+# MAIN PROGRAM
+# ============================================================
+
+def main():
+    """
+    Run validation and Questions 3–5, then save and display results.
+
+    Returns
+    -------
+    None
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Validation runs first; failed checks stop the program.
+    validation_messages = validate_model()
+
+    methods = (
+        "QUESTION 2: METHODS AND VALIDATION\n"
+        "The model constructs an energy balance matrix and solves for "
+        "emitted infrared fluxes using numpy.linalg.solve. Fluxes are "
+        "converted to temperatures using the Stefan-Boltzmann law, "
+        "with surface emissivity 1 and uniform atmospheric emissivity.\n"
+        "Validation compares blackbody and single-layer graybody "
+        "temperatures with analytical results. Additional tests check "
+        "energy conservation, the nuclear winter profile, and the "
+        "transparent-atmosphere boundary case.\n"
+        + "\n".join(validation_messages)
+        + "\n"
+    )
+
+    results = [
+        methods,
+        earth_experiments(),
+        venus_experiment(),
+        nuclear_winter_experiment(),
+    ]
+
+    summary = "\n\n".join(results)
+
+    (OUTPUT_DIR / "results_summary.txt").write_text(
+        summary, encoding="utf-8"
+    )
+
+    print(summary)
+    print(f"\nFigures, CSV tables, and summary saved to:\n{OUTPUT_DIR}")
+
+    # All figures are generated before display, avoiding pauses between
+    # experiments. Set SHOW_PLOTS = False to save without opening windows.
+    if SHOW_PLOTS:
+        plt.show()
+    else:
+        plt.close("all")
+
+
+if __name__ == "__main__":
+    main()
