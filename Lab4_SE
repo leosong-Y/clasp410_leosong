@@ -1,0 +1,976 @@
+"""
+Lab 4: Snowball Earth.
+
+This version contains the four assigned experiments, with supplementary validation tests
+and their outputs omitted. Convergence and basic input checks are retained
+because they control the calculations themselves.
+
+Conventions:
+1. The supplied temp_warm() and insolation() algorithms are embedded below.
+2. The printed numerical heat denominator rho*C*depth is retained. Its units are inconsistent with the handout calling C volumetric heat capacity.
+3. The chosen reflected-endpoint stencil is explicit in make_grid(); the classroom matrices were not included in the supplied handout.
+4. Flash freeze uses fixed albedo 0.6. Other Part 3 and Part 4 cases update albedo at each step using the -10 C threshold.
+"""
+from pathlib import Path
+import json
+import csv
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from scipy.optimize import least_squares
+
+# Supplied helper algorithms, included here for a standalone script.
+def temp_warm(lats_in):
+    '''
+    Create a temperature profile for modern day "warm" earth.
+
+    Parameters
+    ----------
+    lats_in : Numpy array
+        Array of latitudes in degrees where temperature is required.
+        0 corresponds to the south pole, 180 to the north.
+
+    Returns
+    -------
+    temp : Numpy array
+        Temperature in Celcius.
+    '''
+
+    # Set initial temperature curve
+    T_warm = np.array([-47, -19, -11, 1, 9, 14, 19, 23, 25, 25,
+                       23, 19, 14, 9, 1, -11, -19, -47])
+
+    # Get base grid:
+    npoints = T_warm.size
+    dlat = 180 / npoints  # Latitude spacing.
+    lats = np.linspace(dlat/2., 180-dlat/2., npoints)  # Lat cell centers.
+
+    # Fit a parabola to the above values
+    coeffs = np.polyfit(lats, T_warm, 2)
+
+    # Now, return fitting sampled at "lats".
+    temp = coeffs[2] + coeffs[1]*lats_in + coeffs[0] * lats_in**2
+
+    return temp
+
+
+def insolation(S0, lats):
+    '''
+    Given a solar constant (S0), calculate average annual, longitude-averaged
+    insolation values as a function of latitude.
+    Insolation is returned at position `lats` in units of W/m^2.
+
+    Parameters
+    ----------
+    S0 : float
+        Solar constant (1370 for typical Earth conditions.)
+    lats : Numpy array
+        Latitudes to output insolation. Following the grid standards set in
+        the diffusion program, polar angle is defined from the south pole.
+        In other words, 0 is the south pole, 180 the north.
+
+    Returns
+    -------
+    insolation : numpy array
+        Insolation returned over the input latitudes.
+    '''
+
+    # Constants:
+    max_tilt = 23.5   # tilt of earth in degrees
+
+    # Create an array to hold insolation:
+    insolation = np.zeros(lats.size)
+
+    #  Daily rotation of earth reduces solar constant by distributing the sun
+    #  energy all along a zonal band
+    dlong = 0.01  # Use 1/100 of a degree in summing over latitudes
+    angle = np.cos(np.pi/180. * np.arange(0, 360, dlong))
+    angle[angle < 0] = 0
+    total_solar = S0 * angle.sum()
+    S0_avg = total_solar / (360/dlong)
+
+    # Accumulate normalized insolation through a year.
+    # Start with the spin axis tilt for every day in 1 year:
+    tilt = [max_tilt * np.cos(2.0*np.pi*day/365) for day in range(365)]
+
+    # Apply to each latitude zone:
+    for i, lat in enumerate(lats):
+        # Get solar zenith; do not let it go past 180. Convert to latitude.
+        zen = lat - 90. + tilt
+        zen[zen > 90] = 90
+        # Use zenith angle to calculate insolation as function of latitude.
+        insolation[i] = S0_avg * np.sum(np.cos(np.pi/180. * zen)) / 365.
+
+    # Average over entire year; multiply by S0 amplitude:
+    insolation = S0_avg * insolation / 365
+
+    return insolation
+
+try:
+    from numba import njit
+except ImportError:
+    def njit(*args, **kwargs):
+        """
+        Accept optional Numba settings and return an identity decorator.
+
+        Inputs are ignored positional/keyword options. The returned callable
+        leaves its input function unchanged when Numba is not installed.
+        """
+        return lambda f: f
+
+# Physical constants and shared model/experiment settings are defined once.
+YEAR = 365.0 * 24 * 3600
+RADIUS = 6_378_000.0
+RHO = 1020.0
+C_HANDOUT = 4.2e6
+DEPTH = 50.0
+HEAT_FACTOR = RHO * C_HANDOUT * DEPTH
+SIGMA = 5.67e-8
+S0 = 1370.0
+KELVIN_OFFSET = 273.15
+NPOINTS = 18
+DEFAULT_DT = 1.0
+REFERENCE_YEARS = 10000.0
+MAX_EQUIL_YEARS = 200000.0
+DEFAULT_DIFFUSIVITY = 100.0
+DEFAULT_EMISSIVITY = 1.0
+DEFAULT_GAMMA = 1.0
+DEFAULT_BOUNDARY = 'lecture'
+ALBEDO_GROUND = 0.3
+ALBEDO_ICE = 0.6
+ICE_THRESHOLD = -10.0
+EQUIL_TOL = 1e-7
+FIT_TOL = 1e-10
+FIT_GRADIENT_TOL = 1e-8
+STEADY_SOLVER_TOL = 1e-12
+STEADY_RESIDUAL_TOL = 1e-5
+MAX_STEADY_EVALUATIONS = 200
+STEADY_TEMPERATURE_BOUNDS = (-KELVIN_OFFSET + 0.001, 2000.0)
+DIFFUSIVITY_MAX = 150.0
+DIFFUSIVITY_SWEEP_STEP = 10.0
+EMISSIVITY_SWEEP_STEP = 0.1
+FIT_MIN_EMISSIVITY = 0.01
+FIT_INITIAL_GUESS = (35.0, 0.7)
+RMSE_GRID_POINTS = 31
+HOT_INITIAL_C = 60.0
+COLD_INITIAL_C = -60.0
+GAMMA_MIN = 0.4
+GAMMA_MAX = 1.4
+GAMMA_STEP = 0.05
+TRACE_EVERY_STEPS = 100
+OUT = Path(__file__).resolve().parent / 'lab04_results'
+
+def make_grid(npoints=NPOINTS, boundary=DEFAULT_BOUNDARY):
+    
+    """
+    0=south pole, 180=north pole; points are band centers.
+
+    lecture: chosen reflected outer-center stencil; the lecture matrices were
+             not supplied, so this name identifies the implementation only.
+    cell: replace only Cartesian endpoint rows by the cell-centered stencil;
+          keep the lecture B matrix. This is a boundary-stencil sensitivity,
+          not a complete conservative cell-centered spherical discretization.
+    Both are exposed so the boundary assumption can be inspected.
+
+    Parameters
+    ----------
+    npoints : int
+        Number of equally spaced latitude bands; must be at least three.
+    boundary : str
+        'lecture' for the primary scheme or 'cell' for stencil sensitivity.
+
+    Returns
+    -------
+    lats : ndarray, shape (npoints,)
+        Band-center polar angles in degrees, measured from the south pole.
+    K, B, spherical : ndarray, shape (npoints, npoints)
+        Cartesian second derivative (m^-2), first derivative (m^-1), and
+        spherical correction (m^-2), respectively.
+    weights : ndarray, shape (npoints,)
+        Normalized band areas used for global temperature and ice averages.
+    """
+
+    if npoints < 3 or boundary not in ('lecture', 'cell'):
+        raise ValueError('Use npoints >= 3 and boundary lecture or cell.')
+    dlat = 180.0/npoints
+    lats = np.linspace(dlat/2, 180-dlat/2, npoints)
+    dy = RADIUS*np.deg2rad(dlat)
+    K = np.diag(-2*np.ones(npoints))
+    K += np.diag(np.ones(npoints-1), 1)+np.diag(np.ones(npoints-1), -1)
+    if boundary == 'lecture':
+        K[0, 1] = K[-1, -2] = 2
+    else:
+        K[0, 0] = K[-1, -1] = -1
+    K /= dy**2
+    B = (np.diag(np.ones(npoints-1), 1)-np.diag(np.ones(npoints-1), -1))/(2*dy)
+    B[0, :] = B[-1, :] = 0
+    area_xz = np.sin(np.deg2rad(lats)) # constant factors cancel in (dA/dy)/A
+    spherical = ((B@area_xz)/area_xz)[:, None]*B
+    weights = area_xz/area_xz.sum() # exact relative band areas on uniform grid
+    return lats, K, B, spherical, weights
+
+@njit(cache=True)
+def _advance(T, M, P, sunlight, emissivity, dt_years, nsteps,
+             dynamic_albedo, fixed_albedo, tolerance, min_steps):
+    
+    """
+    Advance temperature with implicit diffusion and explicit other terms.
+
+    Parameters
+    ----------
+    T : ndarray
+        Initial temperatures in degrees Celsius.
+    M, P : ndarray
+        Precomputed temperature-update and radiative-forcing matrices.
+    sunlight : ndarray
+        Solar flux in W m^-2, including the solar multiplier.
+    emissivity : float
+        Dimensionless longwave emissivity.
+    dt_years : float
+        Time-step duration in years.
+    nsteps : int
+        Maximum number of updates.
+    dynamic_albedo : bool
+        Recompute ice/ground albedo from temperature when true.
+    fixed_albedo : float
+        Albedo used when dynamic_albedo is false.
+    tolerance : float
+        Accepted drift in degrees C/year; zero disables early stopping.
+    min_steps : int
+        Minimum steps before testing the stopping criterion.
+
+    Returns
+    -------
+    T, years, drift, trace : tuple
+        Final temperatures, elapsed years, maximum final-step drift in
+        degrees C/year, and sampled [year, minimum T, maximum T] history.
+    """
+    
+    n = T.size
+    trace = np.empty((nsteps//TRACE_EVERY_STEPS+2, 3))
+    count = 0
+    trace[count, 0] = 0
+    trace[count, 1] = np.min(T)
+    trace[count, 2] = np.max(T)
+    count += 1
+    drift = 0.0
+    for k in range(nsteps):
+        alpha = np.full(n, fixed_albedo)
+        if dynamic_albedo:
+            for i in range(n):
+                alpha[i] = ALBEDO_ICE if T[i] <= ICE_THRESHOLD else ALBEDO_GROUND
+        forcing = (1-alpha)*sunlight-emissivity*SIGMA*(T+KELVIN_OFFSET)**4
+        T_new = M@T+P@forcing
+        drift = np.max(np.abs(T_new-T))/dt_years
+        T = T_new
+        if (k+1)%TRACE_EVERY_STEPS == 0:
+            trace[count, 0] = (k+1)*dt_years
+            trace[count, 1] = np.min(T)
+            trace[count, 2] = np.max(T)
+            count += 1
+        if tolerance > 0 and k+1 >= min_steps and drift < tolerance:
+            return T, (k+1)*dt_years, drift, trace[:count]
+    return T, nsteps*dt_years, drift, trace[:count]
+
+def snowball(npoints=NPOINTS, dt=DEFAULT_DT, tmax=REFERENCE_YEARS,
+             diffusivity=DEFAULT_DIFFUSIVITY, emissivity=DEFAULT_EMISSIVITY,
+             albedo=ALBEDO_GROUND, spherical=True, radiation=True,
+             dynamic_albedo=False, initial=None, gamma=DEFAULT_GAMMA,
+             tolerance=0.0, min_years=REFERENCE_YEARS, boundary=DEFAULT_BOUNDARY):
+    
+    """
+    Return latitude, final temperature, and convergence metadata.
+
+    Temperatures are Celsius except in the blackbody expression. dt/tmax are
+    years; diffusivity is m2/s. With tolerance=0, run exactly tmax years.
+    A positive tolerance allows stopping after min_years once max|dT/dt|
+    is below tolerance in degrees C/year. Only diffusion is implicit.
+
+    Parameters
+    ----------
+    npoints : int
+        Number of latitude bands.
+    dt, tmax, min_years : float
+        Time step, maximum duration, and earliest stopping time, in years.
+    diffusivity : float
+        Meridional thermal diffusivity in m^2/s.
+    emissivity, albedo, gamma : float
+        Dimensionless emissivity, fixed albedo, and solar multiplier.
+    spherical, radiation : bool
+        Enable spherical geometry and radiative forcing, respectively.
+    dynamic_albedo : bool
+        Replace fixed albedo with temperature-dependent ice/ground values.
+    initial : float, ndarray, or None
+        Initial temperature in degrees C; None selects temp_warm(lats).
+    tolerance : float
+        Accepted final drift in degrees C/year; zero runs all time steps.
+    boundary : str
+        Boundary convention passed to make_grid.
+
+    Returns
+    -------
+    lats, T, info : tuple
+        Polar-angle grid (degrees), final temperatures (degrees C), and a
+        dictionary of elapsed years, drift, convergence status, area-weighted
+        global mean/ice fraction, temperature extrema, and trace history.
+    """
+    
+    if dt <= 0 or tmax <= 0 or diffusivity < 0 or not 0 <= emissivity <= 1:
+        raise ValueError("Invalid time step, duration, diffusivity, or emissivity.")
+
+    lats, K, B, S, weights = make_grid(npoints, boundary)
+
+    T = (
+        temp_warm(lats)
+        if initial is None
+        else np.broadcast_to(initial, (npoints,)).copy().astype(float)
+    )
+
+    if not np.all(np.isfinite(T)) or np.any(T <= -KELVIN_OFFSET):
+        raise ValueError("Initial temperatures must be finite and above absolute zero.")
+
+    dtsec = dt * YEAR
+
+    L_inv = np.linalg.inv(np.eye(npoints) - dtsec * diffusivity * K)
+    M = L_inv @ (np.eye(npoints) + dtsec * diffusivity * S) if spherical else L_inv
+    P = L_inv * (dtsec / HEAT_FACTOR) if radiation else np.zeros((npoints, npoints))
+
+    sunlight = gamma * insolation(S0, lats) if radiation else np.zeros(npoints)
+    eps = emissivity if radiation else 0.0
+
+    T, years, drift, trace = _advance(
+        T,
+        M,
+        P,
+        sunlight,
+        eps,
+        dt,
+        int(round(tmax / dt)),
+        dynamic_albedo,
+        albedo,
+        tolerance,
+        int(np.ceil(min_years / dt)),
+    )
+
+    if not np.all(np.isfinite(T)) or np.any(T <= -KELVIN_OFFSET):
+        raise FloatingPointError("Nonphysical time integration; reduce dt.")
+
+    info = {
+        "years": float(years),
+        "max_drift_C_per_year": float(drift),
+        "converged": bool(tolerance > 0 and drift < tolerance),
+        "global_mean_C": float(weights @ T),
+        "ice_area_fraction": float(weights @ (T <= ICE_THRESHOLD)),
+        "minimum_C": float(T.min()),
+        "maximum_C": float(T.max()),
+        "trace": trace,
+    }
+
+    return lats, T, info
+
+
+def equilibrium(
+    diffusivity,
+    emissivity,
+    npoints=NPOINTS,
+    albedo=ALBEDO_GROUND,
+    gamma=DEFAULT_GAMMA,
+    boundary=DEFAULT_BOUNDARY,
+):
+    """
+    Constant-albedo steady solution for efficient parameter fitting.
+
+    Solves the same semidiscrete equations as the time integrator. The
+    epsilon=0 endpoint has no equilibrium for gamma>0 and alpha<1.
+
+    Parameters
+    ----------
+    diffusivity : float
+        Thermal diffusivity in m^2/s.
+    emissivity, albedo, gamma : float
+        Dimensionless positive emissivity, fixed albedo, and solar multiplier.
+    npoints : int
+        Number of latitude bands.
+    boundary : str
+        Boundary convention passed to make_grid.
+
+    Returns
+    -------
+    ndarray, shape (npoints,)
+        Equilibrium temperatures in degrees C. An exception is raised for
+        zero emissivity or an unconverged nonlinear steady solution.
+    """
+
+    if emissivity <= 0:
+        raise ValueError("No equilibrium with zero emissivity and absorbed sunlight.")
+
+    lats, K, B, S, w = make_grid(npoints, boundary)
+    Q = gamma * insolation(S0, lats) * (1 - albedo)
+
+    if diffusivity == 0:
+        return (Q / (emissivity * SIGMA)) ** 0.25 - KELVIN_OFFSET
+
+    D = diffusivity * (K + S) * HEAT_FACTOR
+
+    def residual(T):
+        """Map input T (degrees C) to the net heating vector (W m^-2)."""
+        return D @ T + Q - emissivity * SIGMA * (T + KELVIN_OFFSET) ** 4
+
+    def jac(T):
+        """Map input T (degrees C) to the heating Jacobian (W m^-2 K^-1)."""
+        return D - np.diag(4 * emissivity * SIGMA * (T + KELVIN_OFFSET) ** 3)
+
+    sol = least_squares(
+        residual,
+        temp_warm(lats),
+        jac=jac,
+        bounds=STEADY_TEMPERATURE_BOUNDS,
+        xtol=STEADY_SOLVER_TOL,
+        ftol=STEADY_SOLVER_TOL,
+        gtol=FIT_TOL,
+        max_nfev=MAX_STEADY_EVALUATIONS,
+    )
+
+    if not sol.success or np.max(np.abs(residual(sol.x))) > STEADY_RESIDUAL_TOL:
+        raise RuntimeError("Steady solution did not converge.")
+
+    return sol.x
+
+
+def _info(info):
+    """Return a copy of input diagnostics dict info without its trace array."""
+
+    return {k: v for k, v in info.items() if k != "trace"}
+
+
+def _csv(name, columns, rows):
+    """
+    Write input rows under columns to data/name and return None.
+
+    name is a CSV basename; columns is a sequence of headings; rows is an
+    iterable of equally ordered record sequences. The data folder must exist.
+    """
+
+    with (OUT / "data" / name).open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        writer.writerows(rows)
+
+
+def _save(fig, name):
+    """Save input Matplotlib fig as figures/name.png, close it, return None."""
+
+    fig.savefig(OUT / "figures" / f"{name}.png", dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _axes(ax, title=None):
+    """Format input Matplotlib axis ax, optionally set title, and return None."""
+
+    ax.set(
+        xlabel="Latitude (degrees north)",
+        ylabel="Temperature (deg C)",
+        xticks=np.arange(-90, 91, 30),
+        xlim=(-90, 90),
+    )
+
+    ax.grid(alpha=0.22)
+
+    if title:
+        ax.set_title(title)
+
+
+def main():
+    """
+    Run the four assigned experiments and save their results.
+
+    No arguments are required; change the named settings above to adjust a run.
+    Returns a dictionary with settings and Part 1--4 results. Side effects are
+    five PNG figures plus CSV/JSON data in the lab04_results output directory.
+    Supplementary validation experiments are intentionally not run here.
+    """
+
+    # Prepare output folders, plotting defaults, and the common target grid.
+    for name in ("figures", "data"):
+        (OUT / name).mkdir(parents=True, exist_ok=True)
+
+    plt.rcParams.update(
+        {
+            "font.size": 12,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "figure.dpi": 120,
+            "lines.linewidth": 2,
+        }
+    )
+
+    lats, K, B, S, w = make_grid()
+    lat = lats - 90
+    target = temp_warm(lats)
+
+    results = {
+        "settings": {
+            "npoints": NPOINTS,
+            "dt_years": DEFAULT_DT,
+            "reference_years": REFERENCE_YEARS,
+            "heat_factor": HEAT_FACTOR,
+            "boundary": DEFAULT_BOUNDARY,
+            "threshold_C": ICE_THRESHOLD,
+            "convergence_tolerance_C_per_year": EQUIL_TOL,
+            "insolation_global_mean_W_m2": float(w @ insolation(S0, lats)),
+        },
+        "target_global_mean_C": float(w @ target),
+    }
+
+    # PART 1: separate exact 10,000-year reference runs.
+    component_runs = {}
+
+    for label, kw in [
+        ("Cartesian diffusion", dict(spherical=False, radiation=False)),
+        ("Spherical diffusion", dict(radiation=False)),
+        ("Diffusion and radiation", {}),
+    ]:
+        _, T, info = snowball(**kw)
+        component_runs[label] = (T, info)
+
+    results["part1"] = {k: _info(v[1]) for k, v in component_runs.items()}
+
+    fig, ax = plt.subplots(figsize=(7.8, 4.8))
+    ax.plot(lat, target, "k--", label="Initial warm profile")
+
+    for (label, (T, info)), color, style in zip(
+        component_runs.items(),
+        ["#D55E00", "#E69F00", "#009E73"],
+        ["-", ":", "-."],
+    ):
+        ax.plot(lat, T, color=color, linestyle=style, label=label)
+
+    _axes(ax, "Part 1  |  Model components")
+    ax.legend(fontsize=12)
+
+    _save(fig, "01_solver_components")
+
+    _csv(
+        "part1_profiles.csv",
+        ["latitude_deg_north", "initial_C", *component_runs],
+        zip(lat, target, *[v[0] for v in component_runs.values()]),
+    )
+
+    print("Part 1 complete", flush=True)
+
+    # PART 2: each parameter independently, then combined bounded fit.
+    lambdas = np.arange(
+        0,
+        DIFFUSIVITY_MAX + DIFFUSIVITY_SWEEP_STEP,
+        DIFFUSIVITY_SWEEP_STEP,
+    )
+
+    epsilons = np.arange(
+        1,
+        int(round(DEFAULT_EMISSIVITY / EMISSIVITY_SWEEP_STEP)) + 1,
+    ) / (1 / EMISSIVITY_SWEEP_STEP)
+
+    lambda_T = np.array([equilibrium(x, DEFAULT_EMISSIVITY) for x in lambdas])
+    epsilon_T = np.array([equilibrium(DEFAULT_DIFFUSIVITY, x) for x in epsilons])
+
+    _, zero_T, zero_info = snowball(emissivity=0)
+
+    fit = least_squares(
+        lambda p: equilibrium(p[0], p[1]) - target,
+        FIT_INITIAL_GUESS,
+        bounds=([0, FIT_MIN_EMISSIVITY], [DIFFUSIVITY_MAX, DEFAULT_EMISSIVITY]),
+        xtol=FIT_TOL,
+        ftol=FIT_TOL,
+        gtol=FIT_GRADIENT_TOL,
+    )
+
+    lam, eps = map(float, fit.x)
+    best = equilibrium(lam, eps)
+
+    results["part2"] = {
+        "diffusivity": lam,
+        "emissivity": eps,
+        "rmse_C": float(np.sqrt(np.mean((best - target) ** 2))),
+        "area_weighted_rmse_C": float(np.sqrt(w @ ((best - target) ** 2))),
+        "max_error_C": float(np.max(np.abs(best - target))),
+        "global_mean_C": float(w @ best),
+        "epsilon_zero_10000_years": _info(zero_info),
+    }
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 6.8))
+
+    colors = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7"]
+    styles = ["-", "--", "-.", ":", "-"]
+    markers = ["o", "s", "^", "D", "v"]
+
+    for val, color, style, marker in zip(
+        [0, 30, 60, 100, 150],
+        colors,
+        styles,
+        markers,
+    ):
+        axes[0].plot(
+            lat,
+            lambda_T[int(val / 10)],
+            color=color,
+            ls=style,
+            marker=marker,
+            markevery=4,
+            ms=4,
+            label=f"{val} m2/s",
+        )
+
+    for val, color, style, marker in zip(
+        [0.1, 0.3, 0.5, 0.7, 1],
+        colors,
+        styles,
+        markers,
+    ):
+        axes[1].plot(
+            lat,
+            epsilon_T[int(round(val * 10)) - 1],
+            color=color,
+            ls=style,
+            marker=marker,
+            markevery=4,
+            ms=4,
+            label=f"{val:.1f}",
+        )
+
+    for ax, title in zip(
+        axes,
+        [
+            "Diffusivity sensitivity\nEmissivity = 1",
+            "Emissivity sensitivity\nDiffusivity = 100 m2/s",
+        ],
+    ):
+        ax.plot(lat, target, "k--", label="Target")
+        _axes(ax, title)
+
+        ax.legend(
+            fontsize=15,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.20),
+            ncol=2,
+            columnspacing=0.8,
+            handlelength=1.6,
+        )
+
+        ax.tick_params(labelsize=15)
+        ax.xaxis.label.set_size(15)
+        ax.yaxis.label.set_size(15)
+        ax.title.set_size(16)
+
+    fig.tight_layout()
+    _save(fig, "02_parameter_sensitivity")
+
+    ls = np.linspace(0, DIFFUSIVITY_MAX, RMSE_GRID_POINTS)
+    es = np.linspace(EMISSIVITY_SWEEP_STEP, DEFAULT_EMISSIVITY, RMSE_GRID_POINTS)
+
+    errors = np.array(
+        [
+            [
+                np.sqrt(np.mean((equilibrium(x, e) - target) ** 2))
+                for x in ls
+            ]
+            for e in es
+        ]
+    )
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5.4))
+
+    im = axes[0].pcolormesh(
+        ls,
+        es,
+        errors,
+        shading="auto",
+        cmap="viridis_r",
+        vmin=0,
+        vmax=30,
+    )
+
+    axes[0].plot(lam, eps, "w*", ms=12, mec="k")
+
+    axes[0].set(
+        xlabel="Diffusivity (m2/s)",
+        ylabel="Emissivity",
+        title="Joint fit RMSE (deg C)",
+    )
+
+    cb = fig.colorbar(im, ax=axes[0], shrink=0.8, extend="max")
+    cb.ax.tick_params(labelsize=15)
+
+    axes[1].plot(lat, target, "k--", label="Warm Earth target")
+    axes[1].plot(lat, best, color="#0072B2", label="Fitted equilibrium")
+
+    _axes(axes[1], f'Best fit | RMSE = {results["part2"]["rmse_C"]:.2f} deg C')
+    axes[1].legend(fontsize=15)
+
+    for ax in axes:
+        ax.tick_params(labelsize=15)
+        ax.xaxis.label.set_size(15)
+        ax.yaxis.label.set_size(15)
+        ax.title.set_size(16)
+
+    fig.tight_layout()
+    _save(fig, "03_warm_earth_fit")
+
+    _csv(
+        "part2_parameter_sweeps.csv",
+        ["parameter", "value", "global_mean_C", "min_C", "max_C", "rmse_C"],
+        [
+            (
+                p,
+                float(x),
+                float(w @ t),
+                float(t.min()),
+                float(t.max()),
+                float(np.sqrt(np.mean((t - target) ** 2))),
+            )
+            for p, vals, temps in [
+                ("diffusivity", lambdas, lambda_T),
+                ("emissivity", epsilons, epsilon_T),
+            ]
+            for x, t in zip(vals, temps)
+        ],
+    )
+
+    _csv(
+        "part2_zero_emissivity_transient.csv",
+        [
+            "emissivity",
+            "years",
+            "global_mean_C",
+            "min_C",
+            "max_C",
+            "max_drift_C_per_year",
+            "equilibrium_exists",
+        ],
+        [
+            [
+                0,
+                REFERENCE_YEARS,
+                zero_info["global_mean_C"],
+                zero_info["minimum_C"],
+                zero_info["maximum_C"],
+                zero_info["max_drift_C_per_year"],
+                False,
+            ]
+        ],
+    )
+
+    _csv(
+        "part2_fit.csv",
+        ["latitude_deg_north", "target_C", "fitted_C", "residual_C"],
+        zip(lat, target, best, best - target),
+    )
+
+    _csv(
+        "part2_rmse_grid.csv",
+        ["diffusivity", "emissivity", "rmse_C"],
+        [
+            (float(x), float(e), float(errors[j, i]))
+            for j, e in enumerate(es)
+            for i, x in enumerate(ls)
+        ],
+    )
+
+    print(f"Part 2 complete: lambda={lam:.6f}, epsilon={eps:.6f}", flush=True)
+
+    # PART 3: initial-condition dependence. Flash freeze has fixed ice albedo.
+    common = dict(
+        diffusivity=lam,
+        emissivity=eps,
+        tmax=MAX_EQUIL_YEARS,
+        tolerance=EQUIL_TOL,
+    )
+
+    cases = {}
+
+    for name, kw in [
+        ("Hot initial +60 C", dict(initial=HOT_INITIAL_C, dynamic_albedo=True)),
+        ("Cold initial -60 C", dict(initial=COLD_INITIAL_C, dynamic_albedo=True)),
+        ("Flash freeze fixed alpha 0.6", dict(initial=target, albedo=ALBEDO_ICE)),
+    ]:
+        _, T, info = snowball(**common, **kw)
+        cases[name] = (T, info)
+
+    results["part3"] = {k: _info(v[1]) for k, v in cases.items()}
+
+    fig, ax = plt.subplots(figsize=(7.8, 4.8))
+    ax.plot(lat, target, "k--", label="Warm Earth target")
+
+    for (name, (T, info)), style, col, marker in zip(
+        cases.items(),
+        ["-", "-", "--"],
+        ["#D55E00", "#0072B2", "#CC79A7"],
+        ["o", "s", "^"],
+    ):
+        ax.plot(
+            lat,
+            T,
+            style,
+            color=col,
+            marker=marker,
+            markevery=3,
+            ms=4,
+            label=name,
+        )
+
+    ax.axhline(ICE_THRESHOLD, color=".5", ls=":", lw=1, label="Ice threshold")
+
+    _axes(ax, "Part 3  |  Different starting states")
+    ax.legend(fontsize=12)
+
+    _save(fig, "04_initial_conditions")
+
+    _csv(
+        "part3_profiles.csv",
+        ["latitude_deg_north", *cases],
+        zip(lat, *[x[0] for x in cases.values()]),
+    )
+
+    print("Part 3 complete", flush=True)
+
+    # PART 4: continuation, carrying the previous final state into each run.
+    ascending = np.round(
+        np.arange(GAMMA_MIN, GAMMA_MAX + GAMMA_STEP / 2, GAMMA_STEP),
+        2,
+    )
+
+    descending = ascending[-2::-1]  # start at 1.35, retaining the 1.40 turn state
+
+    states = []
+    rows = []
+    T = np.full(NPOINTS, COLD_INITIAL_C)
+
+    for branch, values in [("Increasing", ascending), ("Decreasing", descending)]:
+        for gamma in values:
+            _, T, info = snowball(
+                **common,
+                initial=T,
+                gamma=gamma,
+                dynamic_albedo=True,
+            )
+
+            rows.append(
+                {
+                    "branch": branch,
+                    "gamma": float(gamma),
+                    **_info(info),
+                }
+            )
+
+            states.append(T.copy())
+
+    results["part4"] = rows
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(7.8, 6.7),
+        sharex=True,
+        gridspec_kw={"height_ratios": [2, 1]},
+    )
+
+    for branch, color, marker in [
+        ("Increasing", "#be623c", "o"),
+        ("Decreasing", "#23758e", "s"),
+    ]:
+        selected = [r for r in rows if r["branch"] == branch]
+
+        if branch == "Decreasing":
+            selected = [rows[len(ascending) - 1]] + selected
+
+        x = [r["gamma"] for r in selected]
+
+        axes[0].plot(
+            x,
+            [r["global_mean_C"] for r in selected],
+            marker + "-",
+            color=color,
+            ms=4,
+            label=branch,
+        )
+
+        axes[1].plot(
+            x,
+            [100 * r["ice_area_fraction"] for r in selected],
+            marker + "-",
+            color=color,
+            ms=4,
+        )
+
+    axes[0].set(
+        ylabel="Area-weighted global temperature (deg C)",
+        title="Part 4  |  Solar forcing and hysteresis",
+    )
+
+    axes[0].legend()
+
+    axes[1].set(
+        xlabel="Solar multiplier gamma",
+        ylabel="Ice-covered area (%)",
+        ylim=(-4, 104),
+    )
+
+    for ax in axes:
+        ax.axvline(1, color=".6", ls=":", lw=1)
+        ax.grid(alpha=0.2)
+
+    fig.tight_layout()
+    _save(fig, "05_solar_hysteresis")
+
+    _csv(
+        "part4_hysteresis.csv",
+        list(rows[0]),
+        [list(r.values()) for r in rows],
+    )
+
+    _csv(
+        "part4_latitude_profiles.csv",
+        ["branch", "gamma", *[f"T_{x:+.0f}N_C" for x in lat]],
+        [[r["branch"], r["gamma"], *T] for r, T in zip(rows, states)],
+    )
+
+    print("Part 4 complete", flush=True)
+
+    # Convergence is part of solving the assigned equilibrium experiments,
+    # rather than an extra submitted validation experiment.
+    unfinished = [
+        name
+        for name, (_, info) in cases.items()
+        if not info["converged"]
+    ]
+
+    unfinished += [
+        f"{row['branch']} gamma={row['gamma']:.2f}"
+        for row in rows
+        if not row["converged"]
+    ]
+
+    if unfinished:
+        raise RuntimeError(
+            "Equilibrium duration limit reached: " + ", ".join(unfinished)
+        )
+
+    (OUT / "data" / "results.json").write_text(
+        json.dumps(results, indent=2),
+        encoding="utf-8",
+    )
+
+    print(f"Best-fit diffusivity: {lam:.6f} m2/s")
+    print(f"Best-fit emissivity: {eps:.6f}")
+    print(f"Fit RMSE: {results['part2']['rmse_C']:.3f} C")
+
+    for name, (_, info) in cases.items():
+        print(f"{name}: global mean = {info['global_mean_C']:.3f} C")
+
+    print(f"Saved 5 figures and numerical results to: {OUT}", flush=True)
+
+    return results
+
+
+if __name__ == "__main__":
+    main()
